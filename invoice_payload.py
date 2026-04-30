@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-invoice_payload.py — Faithful port of n8n JS grouping/validation logic.
-Reads verified JSONs, groups, validates, POSTs to n8n endpoint.
+invoice_payload.py — Groups verified JSONs, validates, outputs 1C-ready payload.
+Does NOT send — routine uses curl for that (proxy-aware).
 
 Usage:
     python3 invoice_payload.py \
         --input-dir /tmp/invoices/ \
         --folder-id 1abc2def3ghi \
         --jira-1c-id 000000038 \
-        --endpoint https://webhook.n8n.gdev.inc/webhook/ca443011-fe9d-43df-944e-6c69a058d654
+        --output /tmp/1c_payload.json
 """
 
 import argparse
@@ -16,7 +16,6 @@ import json
 import os
 import re
 import sys
-import urllib.request
 from copy import deepcopy
 from datetime import datetime
 
@@ -308,10 +307,8 @@ def group_and_validate(docs):
     if critical_errors:
         result["critical_errors"] = result.get("critical_errors", []) + critical_errors
 
-    # Clean invoices
     result["invoices"] = clean_invoices(result.get("invoices", []))
 
-    # Default issue_date
     if not result.get("issue_date"):
         result["issue_date"] = datetime.now().strftime("%Y-%m-%d")
 
@@ -336,7 +333,7 @@ def group_and_validate(docs):
 
 
 # ═══════════════════════════════════════════════════════════
-# BUILD & SEND
+# BUILD PAYLOAD
 # ═══════════════════════════════════════════════════════════
 
 def build_payload(result, folder_id, jira_1c_id):
@@ -359,39 +356,16 @@ def build_payload(result, folder_id, jira_1c_id):
     }
 
 
-def post_to_endpoint(payload, endpoint):
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        endpoint, data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            body = resp.read().decode("utf-8")
-            print(f"POST {endpoint} → {resp.status}")
-            if body:
-                print(body[:500])
-            return resp.status
-    except urllib.error.HTTPError as e:
-        print(f"POST failed: {e.code} {e.reason}")
-        print(e.read().decode("utf-8")[:500])
-        return e.code
-    except urllib.error.URLError as e:
-        print(f"POST failed: {e.reason}")
-        return 0
-
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare and send 1C payload")
+    parser = argparse.ArgumentParser(description="Prepare 1C payload from verified JSONs")
     parser.add_argument("--input-dir", required=True, help="Dir with *_verified.json files")
     parser.add_argument("--folder-id", required=True, help="Drive folder ID")
     parser.add_argument("--jira-1c-id", required=True, help="1C identifier from Jira Epic")
-    parser.add_argument(
-        "--endpoint",
-        default="https://webhook.n8n.gdev.inc/webhook/ca443011-fe9d-43df-944e-6c69a058d654",
-        help="n8n webhook URL",
-    )
+    parser.add_argument("--output", default="/tmp/1c_payload.json", help="Output file path")
     args = parser.parse_args()
 
     docs = []
@@ -409,10 +383,13 @@ def main():
     grouped = group_and_validate(docs)
     payload = build_payload(grouped, args.folder_id, args.jira_1c_id)
 
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    # Save to file
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
 
-    status = post_to_endpoint(payload, args.endpoint)
-    sys.exit(0 if 200 <= status < 300 else 1)
+    # Print to stdout
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    print(f"\nPayload saved to {args.output}")
 
 
 if __name__ == "__main__":
