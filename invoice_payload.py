@@ -219,9 +219,10 @@ def group_and_validate(docs):
     return result
 
 
-def build_payload(grouped, folder_id):
+def build_payload(grouped, folder_id, jira_1c_id):
     return {
         "folder_id": folder_id,
+        "jira_1c_id": jira_1c_id,
         "org_name": grouped.get("org_name"),
         "document_type": grouped.get("document_type"),
         "document_number": grouped.get("document_number"),
@@ -263,6 +264,7 @@ def main():
     parser = argparse.ArgumentParser(description="Prepare and send 1C payload")
     parser.add_argument("--input-dir", required=True, help="Dir with *_verified.json files")
     parser.add_argument("--folder-id", required=True, help="Drive folder ID (for n8n to fetch originals)")
+    parser.add_argument("--jira-1c-id", required=True, help="1C identifier from Jira Epic")
     parser.add_argument(
         "--endpoint",
         default="https://webhook.n8n.gdev.inc/webhook/ca443011-fe9d-43df-944e-6c69a058d654",
@@ -287,7 +289,7 @@ def main():
     grouped = group_and_validate(docs)
 
     # Build payload
-    payload = build_payload(grouped, args.folder_id)
+    payload = build_payload(grouped, args.folder_id, args.jira_1c_id)
 
     # Print payload
     print(json.dumps(payload, indent=2, ensure_ascii=False))
