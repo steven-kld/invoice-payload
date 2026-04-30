@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-invoice_payload.py — Reads verified JSONs, groups/validates, POSTs to n8n endpoint.
+invoice_payload.py — Faithful port of n8n JS grouping/validation logic.
+Reads verified JSONs, groups, validates, POSTs to n8n endpoint.
 
 Usage:
     python3 invoice_payload.py \
         --input-dir /tmp/invoices/ \
         --folder-id 1abc2def3ghi \
+        --jira-1c-id 000000038 \
         --endpoint https://webhook.n8n.gdev.inc/webhook/ca443011-fe9d-43df-944e-6c69a058d654
 """
 
@@ -15,8 +17,13 @@ import os
 import re
 import sys
 import urllib.request
+from copy import deepcopy
 from datetime import datetime
 
+
+# ═══════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════
 
 def sanitize(s):
     if not s:
@@ -35,7 +42,23 @@ def format_date(s):
 
 
 def doc_prefix(doc_type):
-    return {"credit_note": "credit note", "proforma": "proforma", "summary": "summary"}.get(doc_type, "invoice")
+    return {
+        "credit_note": "credit note",
+        "proforma": "proforma",
+        "summary": "summary",
+    }.get(doc_type, "invoice")
+
+
+def generate_file_name(doc):
+    doc_number = doc.get("document_number")
+    issue_date = doc.get("issue_date")
+    doc_type = doc.get("document_type", "invoice")
+    original = doc.get("original_filename", "document.pdf")
+    ext = os.path.splitext(original)[1] or ".pdf"
+
+    if doc_number and issue_date:
+        return f"{doc_prefix(doc_type)} {sanitize(doc_number)} dated {format_date(issue_date)}{ext}"
+    return sanitize(os.path.splitext(original)[0]) + ext
 
 
 def extract_currencies(invoices):
@@ -53,143 +76,49 @@ def clean_bank_account(acc):
     return re.sub(r"\s+", "", str(acc))
 
 
-def collect_bank_accounts(doc):
+def collect_bank_accounts(item):
     accs = set()
-    acc = doc.get("org_bank_acc")
+    acc = item.get("org_bank_acc")
     if acc:
         if isinstance(acc, list):
-            accs.update(acc)
-        else:
+            accs.update(a for a in acc if a)
+        elif acc:
             accs.add(acc)
-    for a in doc.get("additional_org_bank_accs", []):
-        accs.add(a)
+    for a in item.get("additional_org_bank_accs", []):
+        if a:
+            accs.add(a)
     return accs
 
 
-def validate_bill_to(doc):
-    errors = []
-    name = (doc.get("bill_to_name") or "").lower()
+def validate_bill_to(obj):
+    name = (obj.get("bill_to_name") or "").lower()
     if "nexters" not in name or "global" not in name:
-        errors.append(
-            f"Ошибка в названии плательщика: указан '{doc.get('bill_to_name')}', ожидалось Nexters Global"
+        obj.setdefault("critical_errors", []).append(
+            f"Ошибка в названии плательщика, указан {obj.get('bill_to_name') or 'null'}, ожидалось Nexters Global"
         )
-        doc["bill_to_name"] = None
-    return errors
+        obj["bill_to_name"] = None
 
 
-def get_leading_type(docs):
-    for d in docs:
-        if d.get("document_type") == "proforma":
+def get_leading_type(group):
+    for item in group:
+        if item.get("document_type") == "proforma":
             return "proforma"
-    for d in docs:
-        if d.get("document_type") == "summary":
+    for item in group:
+        if item.get("document_type") == "summary":
             return "summary"
     return "invoice"
 
 
-def group_and_validate(docs):
-    leading_type = get_leading_type(docs)
-    errors = []
-    critical_errors = []
+def build_file_entry(doc):
+    return {
+        "id": doc.get("document_number"),
+        "file_name": generate_file_name(doc),
+        "drive_file_id": doc.get("drive_file_id"),
+    }
 
-    if leading_type == "proforma":
-        proforma = next((d for d in docs if d.get("document_type") == "proforma"), None)
-        others = [d for d in docs if d is not proforma]
 
-        result = json.loads(json.dumps(proforma))
-        pf_invoices = result.get("invoices", [])
-
-        if len(pf_invoices) > 1:
-            critical_errors.append("proforma_multiple_invoice_lines")
-
-        for other in others:
-            result.setdefault("invoices", []).extend(other.get("invoices", []))
-            for a in collect_bank_accounts(other):
-                if a not in collect_bank_accounts(result):
-                    result.setdefault("additional_org_bank_accs", []).append(a)
-
-        result["document_number"] = f"proforma {proforma.get('document_number', '')}"
-
-    elif leading_type == "summary":
-        summary = next((d for d in docs if d.get("document_type") == "summary"), None)
-        others = [d for d in docs if d is not summary]
-
-        result = json.loads(json.dumps(summary))
-        summary_invoice_ids = {inv["invoice_no"] for inv in result.get("invoices", [])}
-        extra_doc_numbers = []
-
-        for other in others:
-            for inv in other.get("invoices", []):
-                if inv["invoice_no"] in summary_invoice_ids:
-                    existing = next(
-                        (si for si in result["invoices"] if si["invoice_no"] == inv["invoice_no"]),
-                        None,
-                    )
-                    if existing:
-                        if inv.get("totals"):
-                            existing["totals"] = inv["totals"]
-                        if inv.get("description"):
-                            existing["description"] = inv["description"]
-                else:
-                    result["invoices"].append(inv)
-                    extra_doc_numbers.append(
-                        f"{doc_prefix(other.get('document_type', 'invoice'))} {inv['invoice_no']}"
-                    )
-            for a in collect_bank_accounts(other):
-                if a not in collect_bank_accounts(result):
-                    result.setdefault("additional_org_bank_accs", []).append(a)
-
-        doc_num = f"summary {summary.get('document_number', '')}"
-        if extra_doc_numbers:
-            doc_num += ", " + ", ".join(extra_doc_numbers)
-        result["document_number"] = doc_num
-
-    else:
-        result = json.loads(json.dumps(docs[0]))
-        doc_num_parts = [
-            f"{doc_prefix(result.get('document_type', 'invoice'))} {result.get('document_number', '')}"
-        ]
-
-        for doc in docs[1:]:
-            if doc.get("bill_to_name") != result.get("bill_to_name"):
-                critical_errors.append(
-                    f"BILL TO MISMATCH: {result.get('bill_to_name')} vs {doc.get('bill_to_name')}"
-                )
-                result["bill_to_name"] = None
-
-            if doc.get("issue_date") != result.get("issue_date"):
-                if doc.get("issue_date") is None:
-                    errors.append(f"issue_date is null in doc {doc.get('document_number')}")
-                elif result.get("issue_date") is None:
-                    result["issue_date"] = doc["issue_date"]
-                else:
-                    critical_errors.append(
-                        f"ISSUE DATE MISMATCH: {result['issue_date']} vs {doc['issue_date']}"
-                    )
-                    result["issue_date"] = None
-
-            result.setdefault("invoices", []).extend(doc.get("invoices", []))
-            for a in collect_bank_accounts(doc):
-                if a not in collect_bank_accounts(result):
-                    result.setdefault("additional_org_bank_accs", []).append(a)
-
-            doc_num_parts.append(
-                f"{doc_prefix(doc.get('document_type', 'invoice'))} {doc.get('document_number', '')}"
-            )
-
-        result["document_number"] = ", ".join(doc_num_parts)
-
-    # --- Post-processing ---
-    bill_to_errors = validate_bill_to(result)
-    errors.extend(bill_to_errors)
-
-    all_accs = sorted(collect_bank_accounts(result))
-    result["org_bank_acc"] = clean_bank_account(all_accs[0]) if all_accs else None
-    result["additional_org_bank_accs"] = [clean_bank_account(a) for a in all_accs[1:]]
-
-    result["currency"] = extract_currencies(result.get("invoices", []))
-
-    result["invoices"] = [
+def clean_invoices(invoices):
+    return [
         {
             "invoice_no": inv.get("invoice_no"),
             "description": inv.get("description"),
@@ -201,49 +130,239 @@ def group_and_validate(docs):
                 for t in inv.get("totals", [])
             ],
         }
-        for inv in result.get("invoices", [])
+        for inv in (invoices or [])
     ]
 
+
+# ═══════════════════════════════════════════════════════════
+# GROUPING (port of n8n JS)
+# ═══════════════════════════════════════════════════════════
+
+def group_and_validate(docs):
+    leading_type = get_leading_type(docs)
+    errors = []
+    critical_errors = []
+
+    for doc in docs:
+        if "files" not in doc:
+            doc["files"] = [build_file_entry(doc)]
+
+    if leading_type == "proforma":
+        proforma = next((d for d in docs if d.get("document_type") == "proforma"), None)
+        others = [d for d in docs if d is not proforma]
+
+        pf_invoices = proforma.get("invoices", [])
+        if len(pf_invoices) > 1:
+            critical_errors.append("proforma_multiple_invoice_lines")
+
+        if not proforma.get("totals"):
+            if pf_invoices and pf_invoices[0].get("totals"):
+                proforma["totals"] = pf_invoices[0]["totals"]
+            else:
+                critical_errors.append("proforma_without_totals")
+
+        base = deepcopy(proforma)
+        base["invoices"] = []
+
+        for other in others:
+            base["invoices"].extend(other.get("invoices", []))
+            base.setdefault("files", []).extend(other.get("files", []))
+            for a in collect_bank_accounts(other):
+                if a not in collect_bank_accounts(base):
+                    base.setdefault("additional_org_bank_accs", []).append(a)
+
+        base["document_number"] = f"proforma {proforma.get('document_number', '')}"
+
+        all_accs = sorted(collect_bank_accounts(base))
+        base["org_bank_acc"] = list(all_accs)
+        base.pop("additional_org_bank_accs", None)
+
+        base["currency"] = extract_currencies(base.get("invoices", []))
+        if base.get("totals"):
+            for t in base["totals"]:
+                if t.get("currency") and t["currency"] not in base["currency"]:
+                    base["currency"].append(t["currency"])
+
+        result = base
+
+    elif leading_type == "summary":
+        summary = next((d for d in docs if d.get("document_type") == "summary"), None)
+        others = [d for d in docs if d is not summary]
+
+        base = deepcopy(summary)
+        if not base.get("org_bank_acc"):
+            base["org_bank_acc"] = []
+
+        summary_invoice_ids = {inv["invoice_no"] for inv in base.get("invoices", [])}
+        extra_doc_numbers = []
+
+        for other in others:
+            base.setdefault("files", []).extend(other.get("files", []))
+
+            for inv in other.get("invoices", []):
+                if inv["invoice_no"] in summary_invoice_ids:
+                    existing = next(
+                        (si for si in base["invoices"] if si["invoice_no"] == inv["invoice_no"]),
+                        None,
+                    )
+                    if existing:
+                        if inv.get("totals"):
+                            existing["totals"] = inv["totals"]
+                        if inv.get("description"):
+                            existing["description"] = inv["description"]
+                else:
+                    base["invoices"].append(inv)
+                    extra_doc_numbers.append(
+                        f"{doc_prefix(other.get('document_type', 'invoice'))} {inv['invoice_no']}"
+                    )
+
+            for a in collect_bank_accounts(other):
+                if a not in collect_bank_accounts(base):
+                    if isinstance(base.get("org_bank_acc"), list):
+                        base["org_bank_acc"].append(a)
+                    else:
+                        base.setdefault("additional_org_bank_accs", []).append(a)
+
+        doc_num = f"summary {summary.get('document_number', '')}"
+        if extra_doc_numbers:
+            doc_num += ", " + ", ".join(extra_doc_numbers)
+        base["document_number"] = doc_num
+
+        base.pop("totals", None)
+
+        all_accs = sorted(collect_bank_accounts(base))
+        base["org_bank_acc"] = list(all_accs)
+        base.pop("additional_org_bank_accs", None)
+
+        base["currency"] = extract_currencies(base.get("invoices", []))
+
+        result = base
+
+    else:
+        base = deepcopy(docs[0])
+        bank_acc_set = collect_bank_accounts(base)
+
+        doc_num_parts = [
+            f"{doc_prefix(base.get('document_type', 'invoice'))} {base.get('document_number', '')}"
+        ]
+
+        for cur in docs[1:]:
+            if cur.get("bill_to_name") != base.get("bill_to_name"):
+                critical_errors.append(
+                    f"BILL TO MISMATCH: {base.get('bill_to_name')} vs {cur.get('bill_to_name')}"
+                )
+                base["bill_to_name"] = None
+
+            if cur.get("issue_date") != base.get("issue_date"):
+                if cur.get("issue_date") is None:
+                    errors.append(f"issue_date is null in doc {cur.get('document_number')}, kept {base.get('issue_date')}")
+                elif base.get("issue_date") is None:
+                    errors.append(f"issue_date was null, now {cur.get('issue_date')}")
+                    base["issue_date"] = cur["issue_date"]
+                else:
+                    critical_errors.append(f"ISSUE DATE MISMATCH: {base['issue_date']} vs {cur['issue_date']}")
+                    base["issue_date"] = None
+
+            if cur.get("due_date") != base.get("due_date"):
+                if cur.get("due_date") is None:
+                    errors.append(f"due_date is null in doc {cur.get('document_number')}, kept {base.get('due_date')}")
+                elif base.get("due_date") is None:
+                    errors.append(f"due_date was null, now {cur.get('due_date')}")
+                    base["due_date"] = cur["due_date"]
+                else:
+                    critical_errors.append(f"DUE DATE MISMATCH: {base['due_date']} vs {cur['due_date']}")
+                    base["due_date"] = None
+
+            base_vat = base.get("vat_percent") or 0
+            cur_vat = cur.get("vat_percent") or 0
+            if base_vat != cur_vat:
+                critical_errors.append(f"VAT MISMATCH: {base.get('vat_percent')} vs {cur.get('vat_percent')}")
+                base["vat_percent"] = None
+
+            if cur.get("org_name") and cur["org_name"] != base.get("org_name"):
+                if cur["org_name"] not in (base.get("org_name") or ""):
+                    base["org_name"] = (base.get("org_name") or "") + " OR " + cur["org_name"]
+
+            bank_acc_set.update(collect_bank_accounts(cur))
+            base.setdefault("invoices", []).extend(cur.get("invoices", []))
+            base.setdefault("files", []).extend(cur.get("files", []))
+
+            doc_num_parts.append(
+                f"{doc_prefix(cur.get('document_type', 'invoice'))} {cur.get('document_number', '')}"
+            )
+
+        base["document_number"] = ", ".join(doc_num_parts)
+        base.pop("totals", None)
+
+        base["org_bank_acc"] = sorted(bank_acc_set)
+        base.pop("additional_org_bank_accs", None)
+        base["currency"] = extract_currencies(base.get("invoices", []))
+
+        result = base
+
+    # --- Common post-processing ---
+    validate_bill_to(result)
+
+    if errors:
+        result["errors"] = result.get("errors", []) + errors
+    if critical_errors:
+        result["critical_errors"] = result.get("critical_errors", []) + critical_errors
+
+    # Clean invoices
+    result["invoices"] = clean_invoices(result.get("invoices", []))
+
+    # Default issue_date
     if not result.get("issue_date"):
         result["issue_date"] = datetime.now().strftime("%Y-%m-%d")
 
-    # Remove fields 1C doesn't need
-    for key in ["verification_status", "verification_notes"]:
-        result.pop(key, None)
+    # Mark has_file on every invoice
+    file_ids = {f.get("id") for f in result.get("files", []) if f.get("id")}
+    for inv in result.get("invoices", []):
+        inv["has_file"] = inv.get("invoice_no") in file_ids
 
-    if errors:
-        result["errors"] = errors
-    if critical_errors:
-        result["critical_errors"] = critical_errors
+    # Clean bank accounts
+    org_bank_acc = result.get("org_bank_acc")
+    if isinstance(org_bank_acc, list):
+        result["org_bank_acc"] = [clean_bank_account(a) for a in org_bank_acc if a]
+    elif org_bank_acc:
+        result["org_bank_acc"] = clean_bank_account(org_bank_acc)
+
+    # Remove internal fields
+    for key in ["verification_status", "verification_notes", "drive_file_id",
+                "original_filename", "additional_org_bank_accs"]:
+        result.pop(key, None)
 
     return result
 
 
-def build_payload(grouped, folder_id, jira_1c_id):
+# ═══════════════════════════════════════════════════════════
+# BUILD & SEND
+# ═══════════════════════════════════════════════════════════
+
+def build_payload(result, folder_id, jira_1c_id):
     return {
         "folder_id": folder_id,
         "jira_1c_id": jira_1c_id,
-        "org_name": grouped.get("org_name"),
-        "document_type": grouped.get("document_type"),
-        "document_number": grouped.get("document_number"),
-        "org_bank_acc": grouped.get("org_bank_acc"),
-        "additional_org_bank_accs": grouped.get("additional_org_bank_accs", []),
-        "issue_date": grouped.get("issue_date"),
-        "due_date": grouped.get("due_date"),
-        "vat_percent": grouped.get("vat_percent"),
-        "bill_to_name": grouped.get("bill_to_name"),
-        "currency": grouped.get("currency", []),
-        "invoices": grouped.get("invoices", []),
-        "errors": grouped.get("errors", []),
-        "critical_errors": grouped.get("critical_errors", []),
+        "org_name": result.get("org_name"),
+        "document_type": result.get("document_type"),
+        "document_number": result.get("document_number"),
+        "org_bank_acc": result.get("org_bank_acc"),
+        "issue_date": result.get("issue_date"),
+        "due_date": result.get("due_date"),
+        "vat_percent": result.get("vat_percent"),
+        "bill_to_name": result.get("bill_to_name"),
+        "currency": result.get("currency", []),
+        "invoices": result.get("invoices", []),
+        "files": result.get("files", []),
+        "errors": result.get("errors", []),
+        "critical_errors": result.get("critical_errors", []),
     }
 
 
 def post_to_endpoint(payload, endpoint):
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        endpoint,
-        data=data,
+        endpoint, data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -258,12 +377,15 @@ def post_to_endpoint(payload, endpoint):
         print(f"POST failed: {e.code} {e.reason}")
         print(e.read().decode("utf-8")[:500])
         return e.code
+    except urllib.error.URLError as e:
+        print(f"POST failed: {e.reason}")
+        return 0
 
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare and send 1C payload")
     parser.add_argument("--input-dir", required=True, help="Dir with *_verified.json files")
-    parser.add_argument("--folder-id", required=True, help="Drive folder ID (for n8n to fetch originals)")
+    parser.add_argument("--folder-id", required=True, help="Drive folder ID")
     parser.add_argument("--jira-1c-id", required=True, help="1C identifier from Jira Epic")
     parser.add_argument(
         "--endpoint",
@@ -272,7 +394,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # Read verified JSONs
     docs = []
     for fname in sorted(os.listdir(args.input_dir)):
         if fname.endswith("_verified.json"):
@@ -285,16 +406,11 @@ def main():
 
     print(f"Found {len(docs)} verified document(s)")
 
-    # Group and validate
     grouped = group_and_validate(docs)
-
-    # Build payload
     payload = build_payload(grouped, args.folder_id, args.jira_1c_id)
 
-    # Print payload
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
-    # Send to n8n
     status = post_to_endpoint(payload, args.endpoint)
     sys.exit(0 if 200 <= status < 300 else 1)
 
