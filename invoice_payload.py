@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-prepare_1c_payload.py — Reads verified JSONs, groups/validates, outputs 1C-ready payload.
+invoice_payload.py — Reads verified JSONs, groups/validates, POSTs to n8n endpoint.
 
 Usage:
-    python3 prepare_1c_payload.py \
+    python3 invoice_payload.py \
         --input-dir /tmp/invoices/ \
-        --jira-epic-key PAY-123 \
-        --jira-1c-id 12345678 \
         --folder-id 1abc2def3ghi \
-        --email sender@company.com \
-        --output /tmp/1c_payload.json
+        --endpoint https://webhook.n8n.gdev.inc/webhook/ca443011-fe9d-43df-944e-6c69a058d654
 """
 
 import argparse
@@ -17,18 +14,17 @@ import json
 import os
 import re
 import sys
+import urllib.request
 from datetime import datetime
 
 
 def sanitize(s):
-    """Keep only safe chars for filenames."""
     if not s:
         return s
     return re.sub(r"[^A-Za-z0-9 .+'\-()]", "", s)
 
 
 def format_date(s):
-    """YYYY-MM-DD → DD.MM.YYYY"""
     if not s:
         return s
     try:
@@ -39,29 +35,10 @@ def format_date(s):
 
 
 def doc_prefix(doc_type):
-    prefixes = {
-        "credit_note": "credit note",
-        "proforma": "proforma",
-        "summary": "summary",
-    }
-    return prefixes.get(doc_type, "invoice")
-
-
-def generate_filename(doc, original_name="document.pdf"):
-    """Generate 1C-friendly filename."""
-    ext = os.path.splitext(original_name)[1] or ".pdf"
-    doc_number = doc.get("document_number")
-    issue_date = doc.get("issue_date")
-    doc_type = doc.get("document_type", "invoice")
-
-    if doc_number and issue_date:
-        return f"{doc_prefix(doc_type)} {sanitize(doc_number)} dated {format_date(issue_date)}{ext}"
-    
-    return sanitize(os.path.splitext(original_name)[0]) + ext
+    return {"credit_note": "credit note", "proforma": "proforma", "summary": "summary"}.get(doc_type, "invoice")
 
 
 def extract_currencies(invoices):
-    """Collect unique currencies from invoices."""
     currencies = set()
     for inv in invoices or []:
         for t in inv.get("totals", []):
@@ -71,38 +48,12 @@ def extract_currencies(invoices):
 
 
 def clean_bank_account(acc):
-    """Remove spaces from bank account."""
     if not acc:
         return None
     return re.sub(r"\s+", "", str(acc))
 
 
-def validate_bill_to(doc):
-    """Check that bill_to is Nexters Global."""
-    errors = []
-    name = (doc.get("bill_to_name") or "").lower()
-    if "nexters" not in name or "global" not in name:
-        errors.append(
-            f"Ошибка в названии плательщика: указан '{doc.get('bill_to_name')}', "
-            f"ожидалось Nexters Global"
-        )
-        doc["bill_to_name"] = None
-    return errors
-
-
-def get_leading_type(docs):
-    """Determine leading document type for grouping."""
-    for d in docs:
-        if d.get("document_type") == "proforma":
-            return "proforma"
-    for d in docs:
-        if d.get("document_type") == "summary":
-            return "summary"
-    return "invoice"
-
-
 def collect_bank_accounts(doc):
-    """Collect all bank accounts from a document."""
     accs = set()
     acc = doc.get("org_bank_acc")
     if acc:
@@ -115,11 +66,28 @@ def collect_bank_accounts(doc):
     return accs
 
 
+def validate_bill_to(doc):
+    errors = []
+    name = (doc.get("bill_to_name") or "").lower()
+    if "nexters" not in name or "global" not in name:
+        errors.append(
+            f"Ошибка в названии плательщика: указан '{doc.get('bill_to_name')}', ожидалось Nexters Global"
+        )
+        doc["bill_to_name"] = None
+    return errors
+
+
+def get_leading_type(docs):
+    for d in docs:
+        if d.get("document_type") == "proforma":
+            return "proforma"
+    for d in docs:
+        if d.get("document_type") == "summary":
+            return "summary"
+    return "invoice"
+
+
 def group_and_validate(docs):
-    """
-    Group documents by type (proforma > summary > invoice).
-    Merge invoices, validate fields, collect bank accounts.
-    """
     leading_type = get_leading_type(docs)
     errors = []
     critical_errors = []
@@ -128,7 +96,7 @@ def group_and_validate(docs):
         proforma = next((d for d in docs if d.get("document_type") == "proforma"), None)
         others = [d for d in docs if d is not proforma]
 
-        result = json.loads(json.dumps(proforma))  # deep copy
+        result = json.loads(json.dumps(proforma))
         pf_invoices = result.get("invoices", [])
 
         if len(pf_invoices) > 1:
@@ -155,7 +123,7 @@ def group_and_validate(docs):
                 if inv["invoice_no"] in summary_invoice_ids:
                     existing = next(
                         (si for si in result["invoices"] if si["invoice_no"] == inv["invoice_no"]),
-                        None
+                        None,
                     )
                     if existing:
                         if inv.get("totals"):
@@ -177,9 +145,10 @@ def group_and_validate(docs):
         result["document_number"] = doc_num
 
     else:
-        # Invoice / credit note
         result = json.loads(json.dumps(docs[0]))
-        doc_num_parts = [f"{doc_prefix(result.get('document_type', 'invoice'))} {result.get('document_number', '')}"]
+        doc_num_parts = [
+            f"{doc_prefix(result.get('document_type', 'invoice'))} {result.get('document_number', '')}"
+        ]
 
         for doc in docs[1:]:
             if doc.get("bill_to_name") != result.get("bill_to_name"):
@@ -210,19 +179,16 @@ def group_and_validate(docs):
 
         result["document_number"] = ", ".join(doc_num_parts)
 
-    # Common post-processing
+    # --- Post-processing ---
     bill_to_errors = validate_bill_to(result)
     errors.extend(bill_to_errors)
 
-    # Clean bank accounts
     all_accs = sorted(collect_bank_accounts(result))
     result["org_bank_acc"] = clean_bank_account(all_accs[0]) if all_accs else None
     result["additional_org_bank_accs"] = [clean_bank_account(a) for a in all_accs[1:]]
 
-    # Currencies
     result["currency"] = extract_currencies(result.get("invoices", []))
 
-    # Clean invoices
     result["invoices"] = [
         {
             "invoice_no": inv.get("invoice_no"),
@@ -230,17 +196,20 @@ def group_and_validate(docs):
             "totals": [
                 {
                     "currency": t.get("currency"),
-                    "amount": float(t["amount"]) if t.get("amount") is not None else None
+                    "amount": float(t["amount"]) if t.get("amount") is not None else None,
                 }
                 for t in inv.get("totals", [])
-            ]
+            ],
         }
         for inv in result.get("invoices", [])
     ]
 
-    # Default issue_date
     if not result.get("issue_date"):
         result["issue_date"] = datetime.now().strftime("%Y-%m-%d")
+
+    # Remove fields 1C doesn't need
+    for key in ["verification_status", "verification_notes"]:
+        result.pop(key, None)
 
     if errors:
         result["errors"] = errors
@@ -250,13 +219,9 @@ def group_and_validate(docs):
     return result
 
 
-def build_payload(grouped, args):
-    """Build final 1C payload."""
+def build_payload(grouped, folder_id):
     return {
-        "folder_id": args.folder_id,
-        "jira_epic_key": args.jira_epic_key,
-        "jira_1c_id": args.jira_1c_id,
-        "email": args.email,
+        "folder_id": folder_id,
         "org_name": grouped.get("org_name"),
         "document_type": grouped.get("document_type"),
         "document_number": grouped.get("document_number"),
@@ -273,41 +238,63 @@ def build_payload(grouped, args):
     }
 
 
+def post_to_endpoint(payload, endpoint):
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read().decode("utf-8")
+            print(f"POST {endpoint} → {resp.status}")
+            if body:
+                print(body[:500])
+            return resp.status
+    except urllib.error.HTTPError as e:
+        print(f"POST failed: {e.code} {e.reason}")
+        print(e.read().decode("utf-8")[:500])
+        return e.code
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Prepare 1C payload from verified JSONs")
-    parser.add_argument("--input-dir", required=True, help="Dir with verified JSON files")
-    parser.add_argument("--jira-epic-key", default=None, help="Jira Epic key (PAY-123)")
-    parser.add_argument("--jira-1c-id", default=None, help="1C identifier from Jira")
-    parser.add_argument("--folder-id", required=True, help="Drive folder ID")
-    parser.add_argument("--email", default=None, help="Sender email")
-    parser.add_argument("--output", default="/tmp/1c_payload.json", help="Output path")
+    parser = argparse.ArgumentParser(description="Prepare and send 1C payload")
+    parser.add_argument("--input-dir", required=True, help="Dir with *_verified.json files")
+    parser.add_argument("--folder-id", required=True, help="Drive folder ID (for n8n to fetch originals)")
+    parser.add_argument(
+        "--endpoint",
+        default="https://webhook.n8n.gdev.inc/webhook/ca443011-fe9d-43df-944e-6c69a058d654",
+        help="n8n webhook URL",
+    )
     args = parser.parse_args()
 
-    # Read all verified JSONs
+    # Read verified JSONs
     docs = []
-    input_dir = args.input_dir
-    for fname in sorted(os.listdir(input_dir)):
+    for fname in sorted(os.listdir(args.input_dir)):
         if fname.endswith("_verified.json"):
-            path = os.path.join(input_dir, fname)
-            with open(path, "r", encoding="utf-8") as f:
+            with open(os.path.join(args.input_dir, fname), "r", encoding="utf-8") as f:
                 docs.append(json.load(f))
 
     if not docs:
-        print(json.dumps({"error": "No verified JSONs found in " + input_dir}))
+        print(json.dumps({"error": "No *_verified.json found in " + args.input_dir}))
         sys.exit(1)
+
+    print(f"Found {len(docs)} verified document(s)")
 
     # Group and validate
     grouped = group_and_validate(docs)
 
     # Build payload
-    payload = build_payload(grouped, args)
+    payload = build_payload(grouped, args.folder_id)
 
-    # Write output
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-
-    # Also print to stdout for routine to read
+    # Print payload
     print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    # Send to n8n
+    status = post_to_endpoint(payload, args.endpoint)
+    sys.exit(0 if 200 <= status < 300 else 1)
 
 
 if __name__ == "__main__":
